@@ -3,6 +3,8 @@
 [![CI](https://github.com/x-phone/fakepbx/actions/workflows/ci.yml/badge.svg)](https://github.com/x-phone/fakepbx/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/x-phone/fakepbx.svg)](https://pkg.go.dev/github.com/x-phone/fakepbx)
 [![Go Report Card](https://goreportcard.com/badge/github.com/x-phone/fakepbx)](https://goreportcard.com/report/github.com/x-phone/fakepbx)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/x-phone/fakepbx)](https://github.com/x-phone/fakepbx)
 
 In-process SIP server for Go tests. Real SIP over loopback — no Docker, no Asterisk, no hardcoded ports.
 

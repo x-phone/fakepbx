@@ -1,8 +1,6 @@
 package fakepbx
 
 import (
-	"net"
-	"strconv"
 	"sync"
 	"time"
 
@@ -74,16 +72,8 @@ func (inv *Invite) AnswerWithCode(code int, sdp []byte) *ActiveCall {
 	inv.responded.Do(func() {
 		res := sip.NewResponseFromRequest(inv.req, code, "OK", nil)
 		res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
-		// Build Contact with the PBX's actual host:port so in-dialog
-		// requests (BYE, re-INVITE, etc.) route back correctly.
-		contactURI := sip.Uri{Scheme: "sip", Host: "127.0.0.1"}
-		if host, portStr, err := net.SplitHostPort(inv.pbx.addr); err == nil {
-			contactURI.Host = host
-			if p, err := strconv.Atoi(portStr); err == nil {
-				contactURI.Port = p
-			}
-		}
-		res.AppendHeader(&sip.ContactHeader{Address: contactURI})
+		// Contact with PBX's address so in-dialog requests route back correctly.
+		res.AppendHeader(&sip.ContactHeader{Address: inv.pbx.contactURI()})
 		res.SetBody(sdp)
 		inv.tx.Respond(res)
 
@@ -91,11 +81,12 @@ func (inv *Invite) AnswerWithCode(code int, sdp []byte) *ActiveCall {
 		// response is a separate transaction with a new Via branch, so it won't
 		// arrive on tx.Acks(). The ACK is handled by srv.OnAck if needed.
 
-		ac = &ActiveCall{
+		ac = &ActiveCall{dialogCall{
 			pbx: inv.pbx,
 			req: inv.req,
 			res: res,
-		}
+			dir: dirInbound,
+		}}
 	})
 	return ac
 }

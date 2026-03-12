@@ -1,4 +1,4 @@
-// Package fakepbx provides an in-process SIP server (UAS) for testing.
+// Package fakepbx provides an in-process SIP server for testing.
 //
 // It wraps [sipgo] to create a real SIP server bound to 127.0.0.1 on an
 // ephemeral port. Tests get full programmatic control over SIP call flows
@@ -6,15 +6,20 @@
 // SUBSCRIBE — without Docker,
 // external processes, or hardcoded ports.
 //
-// Basic usage:
+// FakePBX works as both UAS (receiving calls) and UAC (initiating calls):
 //
 //	pbx := fakepbx.NewFakePBX(t)
+//
+//	// UAS: handle incoming INVITEs from the device under test
 //	pbx.OnInvite(func(inv *fakepbx.Invite) {
 //	    inv.Trying()
 //	    inv.Ringing()
 //	    inv.Answer(fakepbx.SDP("127.0.0.1", 20000, fakepbx.PCMU))
 //	})
-//	// Point your SIP UA at pbx.Addr() and dial pbx.URI("1002")
+//
+//	// UAC: send an INVITE to the device under test
+//	call, err := pbx.SendInvite(ctx, "sip:alice@127.0.0.1:5060",
+//	    fakepbx.SDP("127.0.0.1", 20000, fakepbx.PCMU))
 //
 // The server is stopped automatically via [testing.TB.Cleanup].
 //
@@ -28,6 +33,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -37,7 +43,7 @@ import (
 	"github.com/emiago/sipgo/sip"
 )
 
-// FakePBX is an in-process SIP UAS for testing.
+// FakePBX is an in-process SIP server for testing.
 type FakePBX struct {
 	t   testing.TB
 	cfg config
@@ -283,6 +289,147 @@ func (pbx *FakePBX) AutoReject(code int, reason string) {
 		inv.Trying()
 		inv.Reject(code, reason)
 	})
+}
+
+// SendInvite initiates an outbound call from the PBX to the given SIP URI.
+// It sends an INVITE with the provided SDP, collects responses, and on 2xx
+// sends ACK automatically. Returns an [OutboundCall] for mid-call control,
+// or an error if the call was rejected or failed.
+func (pbx *FakePBX) SendInvite(ctx context.Context, target string, sdp []byte) (*OutboundCall, error) {
+	var uri sip.Uri
+	if err := sip.ParseUri(target, &uri); err != nil {
+		return nil, fmt.Errorf("fakepbx: invalid target URI %q: %w", target, err)
+	}
+
+	req := sip.NewRequest(sip.INVITE, uri)
+	req.SetTransport(pbx.cfg.transport)
+
+	// Contact: PBX's address so in-dialog requests route back to us.
+	contactURI := pbx.contactURI()
+	req.AppendHeader(&sip.ContactHeader{Address: contactURI})
+
+	if sdp != nil {
+		req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+		req.SetBody(sdp)
+	}
+
+	tx, err := pbx.cli.TransactionRequest(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("fakepbx: INVITE transaction: %w", err)
+	}
+
+	for {
+		select {
+		case res := <-tx.Responses():
+			if res.IsProvisional() {
+				continue
+			}
+			if res.IsSuccess() {
+				pbx.sendACK(req, res)
+				tx.Terminate() // Free transaction resources immediately.
+				call := &OutboundCall{dialogCall{
+					pbx: pbx,
+					req: req,
+					res: res,
+					dir: dirOutbound,
+				}}
+				// Initialize CSeq from the INVITE so subsequent requests increment from here.
+				call.cseq.Store(req.CSeq().SeqNo)
+				return call, nil
+			}
+			// Non-2xx final response — call rejected.
+			tx.Terminate()
+			return nil, fmt.Errorf("fakepbx: INVITE rejected: %d %s", res.StatusCode, res.Reason)
+		case <-tx.Done():
+			return nil, fmt.Errorf("fakepbx: INVITE transaction ended: %w", tx.Err())
+		case <-ctx.Done():
+			tx.Terminate()
+			return nil, ctx.Err()
+		}
+	}
+}
+
+// SendMessage sends an out-of-dialog SIP MESSAGE to the given target URI.
+func (pbx *FakePBX) SendMessage(ctx context.Context, target string, contentType string, body []byte) error {
+	var uri sip.Uri
+	if err := sip.ParseUri(target, &uri); err != nil {
+		return fmt.Errorf("fakepbx: invalid target URI %q: %w", target, err)
+	}
+
+	req := sip.NewRequest(sip.MESSAGE, uri)
+	req.SetTransport(pbx.cfg.transport)
+	req.AppendHeader(&sip.ContactHeader{Address: pbx.contactURI()})
+	if contentType != "" {
+		req.AppendHeader(sip.NewHeader("Content-Type", contentType))
+	}
+	if body != nil {
+		req.SetBody(body)
+	}
+
+	res, err := pbx.cli.Do(ctx, req)
+	if err != nil {
+		return fmt.Errorf("fakepbx: MESSAGE: %w", err)
+	}
+	if !res.IsSuccess() {
+		return fmt.Errorf("fakepbx: MESSAGE rejected: %d %s", res.StatusCode, res.Reason)
+	}
+	return nil
+}
+
+// SendOptions sends an out-of-dialog SIP OPTIONS to the given target URI.
+// Returns the response so callers can inspect capabilities (Allow, Supported, etc.).
+func (pbx *FakePBX) SendOptions(ctx context.Context, target string) (*sip.Response, error) {
+	var uri sip.Uri
+	if err := sip.ParseUri(target, &uri); err != nil {
+		return nil, fmt.Errorf("fakepbx: invalid target URI %q: %w", target, err)
+	}
+
+	req := sip.NewRequest(sip.OPTIONS, uri)
+	req.SetTransport(pbx.cfg.transport)
+
+	res, err := pbx.cli.Do(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("fakepbx: OPTIONS: %w", err)
+	}
+	return res, nil
+}
+
+// sendACK sends an ACK for a 2xx INVITE response (RFC 3261 §13.2.2.4).
+func (pbx *FakePBX) sendACK(invReq *sip.Request, invRes *sip.Response) {
+	ack := sip.NewRequest(sip.ACK, invReq.Recipient)
+	ack.SipVersion = "SIP/2.0"
+	ack.SetTransport(pbx.cfg.transport)
+
+	if h := invReq.From(); h != nil {
+		ack.AppendHeader(sip.HeaderClone(h))
+	}
+	if h := invRes.To(); h != nil {
+		ack.AppendHeader(sip.HeaderClone(h))
+	}
+	if h := invReq.CallID(); h != nil {
+		hdr := sip.CallIDHeader(*h)
+		ack.AppendHeader(&hdr)
+	}
+	ack.AppendHeader(&sip.CSeqHeader{SeqNo: invReq.CSeq().SeqNo, MethodName: sip.ACK})
+	maxfwd := sip.MaxForwardsHeader(70)
+	ack.AppendHeader(&maxfwd)
+	ack.SetBody(nil)
+
+	if err := pbx.cli.WriteRequest(ack); err != nil {
+		pbx.t.Logf("fakepbx: sendACK: %v", err)
+	}
+}
+
+// contactURI returns a SIP URI for the PBX's listening address.
+func (pbx *FakePBX) contactURI() sip.Uri {
+	contactURI := sip.Uri{Scheme: "sip", Host: "127.0.0.1"}
+	if host, portStr, err := net.SplitHostPort(pbx.addr); err == nil {
+		contactURI.Host = host
+		if p, err := strconv.Atoi(portStr); err == nil {
+			contactURI.Port = p
+		}
+	}
+	return contactURI
 }
 
 // record saves a request for later inspection.

@@ -100,6 +100,19 @@ pbx.OnInvite(func(inv *fakepbx.Invite) {
 call.SendBye(context.Background()) // PBX initiates hangup
 ```
 
+### Outbound Call (PBX Calls Your UA)
+
+```go
+ctx := context.Background()
+call, err := pbx.SendInvite(ctx, "sip:alice@127.0.0.1:5060",
+    fakepbx.SDP("127.0.0.1", 20000, fakepbx.PCMU))
+if err != nil {
+    t.Fatal(err)
+}
+// call is an *OutboundCall — same mid-call methods as ActiveCall
+defer call.SendBye(ctx)
+```
+
 ### Re-INVITE (Hold)
 
 ```go
@@ -110,10 +123,30 @@ call.SendReInvite(context.Background(), holdSDP)
 ### REFER (Call Transfer)
 
 ```go
+// Receiving REFER from your UA:
 pbx.OnRefer(func(ref *fakepbx.Refer) {
     fmt.Println("transfer to:", ref.ReferTo())
     ref.Accept() // 202 Accepted
 })
+
+// Sending REFER to your UA (within an established call):
+call.SendRefer(ctx, "sip:bob@192.168.1.100")
+```
+
+### Send MESSAGE
+
+```go
+err := pbx.SendMessage(ctx, "sip:alice@127.0.0.1:5060",
+    "text/plain", []byte("Hello from PBX"))
+```
+
+### Send OPTIONS (Health Check)
+
+```go
+res, err := pbx.SendOptions(ctx, "sip:alice@127.0.0.1:5060")
+if err == nil {
+    fmt.Println("Allow:", res.GetHeader("Allow").Value())
+}
 ```
 
 ### Registration with Auth Challenge
@@ -160,9 +193,10 @@ func TestB(t *testing.T) {
 
 | Type | Purpose |
 |---|---|
-| `FakePBX` | The SIP server. Create with `NewFakePBX(t)`. |
+| `FakePBX` | The SIP server. Create with `NewFakePBX(t)`. UAC: `SendInvite()`, `SendMessage()`, `SendOptions()` |
 | `Invite` | Handle for INVITE. `Trying()`, `Ringing()`, `Answer()`, `Reject()`, `WaitForCancel()` |
-| `ActiveCall` | Returned by `Answer()`. `SendBye()`, `SendReInvite()`, `SendNotify()` |
+| `ActiveCall` | Returned by `Answer()`. `SendBye()`, `SendReInvite()`, `SendRefer()`, `SendNotify()` |
+| `OutboundCall` | Returned by `SendInvite()`. Same mid-call methods as `ActiveCall` |
 | `Register` | Handle for REGISTER. `Accept()`, `Challenge()`, `Reject()` |
 | `Bye` | Handle for BYE. `Accept()`, `Reject()` |
 | `Cancel` | Handle for CANCEL (notification-only). `Request()` |

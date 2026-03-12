@@ -2233,13 +2233,14 @@ func TestWaitForRegister_AlreadyMet(t *testing.T) {
 // Phase 2: Outbound INVITE (UAC) Tests
 // =============================================================================
 
-// testUAS creates a sipgo UA + Server + Client that auto-answers INVITEs.
-// Returns its listening address so the PBX can send INVITEs to it.
+// testUAS creates a sipgo UA + Server + Client for receiving SIP requests.
+// Handlers must be registered on uas.srv BEFORE calling uas.start(t).
+// This avoids a data race with sipgo's internal handler map.
 type testUASInfo struct {
 	cli  *sipgo.Client
 	srv  *sipgo.Server
 	ua   *sipgo.UserAgent
-	addr string // "127.0.0.1:PORT"
+	addr string // "127.0.0.1:PORT" — set after start()
 }
 
 func testUAS(t *testing.T) *testUASInfo {
@@ -2261,16 +2262,22 @@ func testUAS(t *testing.T) *testUASInfo {
 		t.Fatalf("testUAS: NewClient: %v", err)
 	}
 
-	var addr string
+	return &testUASInfo{cli: cli, srv: srv, ua: ua}
+}
+
+// start begins listening on an ephemeral port. Must be called after all
+// handlers are registered on u.srv.
+func (u *testUASInfo) start(t *testing.T) {
+	t.Helper()
 	ready := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 
 	go func() {
 		readyFn := sipgo.ListenReadyFuncCtxValue(func(network, a string) {
-			addr = a
+			u.addr = a
 			close(ready)
 		})
-		srv.ListenAndServe(
+		u.srv.ListenAndServe(
 			context.WithValue(ctx, sipgo.ListenReadyCtxKey, readyFn),
 			"udp", "127.0.0.1:0",
 		)
@@ -2280,16 +2287,14 @@ func testUAS(t *testing.T) *testUASInfo {
 	case <-ready:
 	case <-time.After(5 * time.Second):
 		cancel()
-		ua.Close()
+		u.ua.Close()
 		t.Fatal("testUAS: server did not start")
 	}
 
 	t.Cleanup(func() {
 		cancel()
-		ua.Close()
+		u.ua.Close()
 	})
-
-	return &testUASInfo{cli: cli, srv: srv, ua: ua, addr: addr}
 }
 
 // uasURI returns a SIP URI for the test UAS: "sip:EXT@127.0.0.1:PORT"
@@ -2298,10 +2303,10 @@ func (u *testUASInfo) uasURI(ext string) string {
 }
 
 // autoAnswer makes the test UAS auto-answer INVITEs with 200 OK + SDP.
-func (u *testUASInfo) autoAnswer(t *testing.T, answerSDP []byte) {
-	t.Helper()
-	host, port, _ := sip.ParseAddr(u.addr)
+// Must be called before start().
+func (u *testUASInfo) autoAnswer(answerSDP []byte) {
 	u.srv.OnInvite(func(req *sip.Request, tx sip.ServerTransaction) {
+		host, port, _ := sip.ParseAddr(u.addr)
 		res := sip.NewResponseFromRequest(req, 200, "OK", nil)
 		res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
 		res.AppendHeader(&sip.ContactHeader{
@@ -2315,7 +2320,8 @@ func (u *testUASInfo) autoAnswer(t *testing.T, answerSDP []byte) {
 func TestSendInvite_Basic(t *testing.T) {
 	pbx := NewFakePBX(t)
 	uas := testUAS(t)
-	uas.autoAnswer(t, SDP("127.0.0.1", 40000, PCMU))
+	uas.autoAnswer(SDP("127.0.0.1", 40000, PCMU))
+	uas.start(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -2343,11 +2349,11 @@ func TestSendInvite_Basic(t *testing.T) {
 func TestSendInvite_Rejected(t *testing.T) {
 	pbx := NewFakePBX(t)
 	uas := testUAS(t)
-
 	uas.srv.OnInvite(func(req *sip.Request, tx sip.ServerTransaction) {
 		res := sip.NewResponseFromRequest(req, 486, "Busy Here", nil)
 		tx.Respond(res)
 	})
+	uas.start(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -2379,13 +2385,13 @@ func TestSendInvite_InvalidURI(t *testing.T) {
 func TestSendInvite_CancelledContext(t *testing.T) {
 	pbx := NewFakePBX(t)
 	uas := testUAS(t)
-
 	// UAS delays answer — context will be cancelled before it responds.
 	uas.srv.OnInvite(func(req *sip.Request, tx sip.ServerTransaction) {
 		time.Sleep(2 * time.Second)
 		res := sip.NewResponseFromRequest(req, 200, "OK", nil)
 		tx.Respond(res)
 	})
+	uas.start(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -2399,14 +2405,14 @@ func TestSendInvite_CancelledContext(t *testing.T) {
 func TestSendInvite_SendBye(t *testing.T) {
 	pbx := NewFakePBX(t)
 	uas := testUAS(t)
-	uas.autoAnswer(t, SDP("127.0.0.1", 40000, PCMU))
-
+	uas.autoAnswer(SDP("127.0.0.1", 40000, PCMU))
 	byeReceived := make(chan struct{}, 1)
 	uas.srv.OnBye(func(req *sip.Request, tx sip.ServerTransaction) {
 		res := sip.NewResponseFromRequest(req, 200, "OK", nil)
 		tx.Respond(res)
 		close(byeReceived)
 	})
+	uas.start(t)
 
 	ctx := context.Background()
 
@@ -2429,17 +2435,15 @@ func TestSendInvite_SendBye(t *testing.T) {
 func TestSendInvite_SendReInvite(t *testing.T) {
 	pbx := NewFakePBX(t)
 	uas := testUAS(t)
-	uas.autoAnswer(t, SDP("127.0.0.1", 40000, PCMU))
 
 	reinviteReceived := make(chan []byte, 1)
-	// Override OnInvite to handle both initial and re-INVITE.
-	host, port, _ := sip.ParseAddr(uas.addr)
 	var first sync.Once
 	uas.srv.OnInvite(func(req *sip.Request, tx sip.ServerTransaction) {
 		isFirst := false
 		first.Do(func() { isFirst = true })
 		if isFirst {
 			// Initial INVITE — answer normally.
+			host, port, _ := sip.ParseAddr(uas.addr)
 			res := sip.NewResponseFromRequest(req, 200, "OK", nil)
 			res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
 			res.AppendHeader(&sip.ContactHeader{
@@ -2454,6 +2458,7 @@ func TestSendInvite_SendReInvite(t *testing.T) {
 			tx.Respond(res)
 		}
 	})
+	uas.start(t)
 
 	ctx := context.Background()
 
@@ -2480,7 +2485,8 @@ func TestSendInvite_SendReInvite(t *testing.T) {
 func TestSendInvite_RemoteBye(t *testing.T) {
 	pbx := NewFakePBX(t)
 	uas := testUAS(t)
-	uas.autoAnswer(t, SDP("127.0.0.1", 40000, PCMU))
+	uas.autoAnswer(SDP("127.0.0.1", 40000, PCMU))
+	uas.start(t)
 
 	ctx := context.Background()
 
@@ -2537,7 +2543,8 @@ func TestSendInvite_RemoteBye(t *testing.T) {
 func TestSendInvite_Concurrent(t *testing.T) {
 	pbx := NewFakePBX(t)
 	uas := testUAS(t)
-	uas.autoAnswer(t, SDP("127.0.0.1", 40000, PCMU))
+	uas.autoAnswer(SDP("127.0.0.1", 40000, PCMU))
+	uas.start(t)
 
 	const numCalls = 5
 	calls := make([]*OutboundCall, numCalls)
@@ -2588,9 +2595,7 @@ func TestSendInvite_Concurrent(t *testing.T) {
 func TestSendInvite_WithProvisionals(t *testing.T) {
 	pbx := NewFakePBX(t)
 	uas := testUAS(t)
-
 	// UAS sends 100 + 180 + 200.
-	host, port, _ := sip.ParseAddr(uas.addr)
 	uas.srv.OnInvite(func(req *sip.Request, tx sip.ServerTransaction) {
 		res100 := sip.NewResponseFromRequest(req, 100, "Trying", nil)
 		tx.Respond(res100)
@@ -2602,6 +2607,7 @@ func TestSendInvite_WithProvisionals(t *testing.T) {
 
 		time.Sleep(10 * time.Millisecond)
 
+		host, port, _ := sip.ParseAddr(uas.addr)
 		res200 := sip.NewResponseFromRequest(req, 200, "OK", nil)
 		res200.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
 		res200.AppendHeader(&sip.ContactHeader{
@@ -2610,6 +2616,7 @@ func TestSendInvite_WithProvisionals(t *testing.T) {
 		res200.SetBody(SDP("127.0.0.1", 40000, PCMU))
 		tx.Respond(res200)
 	})
+	uas.start(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -2626,8 +2633,7 @@ func TestSendInvite_WithProvisionals(t *testing.T) {
 func TestSendInvite_CSeq_Increments(t *testing.T) {
 	pbx := NewFakePBX(t)
 	uas := testUAS(t)
-	uas.autoAnswer(t, SDP("127.0.0.1", 40000, PCMU))
-
+	uas.autoAnswer(SDP("127.0.0.1", 40000, PCMU))
 	var cseqs []uint32
 	var mu sync.Mutex
 	recordCSeq := func(req *sip.Request, tx sip.ServerTransaction) {
@@ -2639,6 +2645,7 @@ func TestSendInvite_CSeq_Increments(t *testing.T) {
 	}
 	uas.srv.OnNotify(recordCSeq)
 	uas.srv.OnBye(recordCSeq)
+	uas.start(t)
 
 	ctx := context.Background()
 
@@ -2661,6 +2668,246 @@ func TestSendInvite_CSeq_Increments(t *testing.T) {
 	}
 	if cseqs[0] >= cseqs[1] {
 		t.Fatalf("CSeq not strictly increasing: %v", cseqs)
+	}
+}
+
+// =============================================================================
+// Phase 3: In-Dialog REFER (UAC) Tests
+// =============================================================================
+
+func TestSendRefer_Basic(t *testing.T) {
+	pbx := NewFakePBX(t)
+	uas := testUAS(t)
+	uas.autoAnswer(SDP("127.0.0.1", 40000, PCMU))
+	gotReferTo := make(chan string, 1)
+	uas.srv.OnRefer(func(req *sip.Request, tx sip.ServerTransaction) {
+		val := ""
+		if h := req.GetHeader("Refer-To"); h != nil {
+			val = h.Value()
+		}
+		res := sip.NewResponseFromRequest(req, 202, "Accepted", nil)
+		tx.Respond(res)
+		gotReferTo <- val
+	})
+	uas.start(t)
+
+	ctx := context.Background()
+
+	call, err := pbx.SendInvite(ctx, uas.uasURI("alice"), SDP("127.0.0.1", 20000, PCMU))
+	if err != nil {
+		t.Fatalf("SendInvite: %v", err)
+	}
+
+	target := "sip:bob@192.168.1.100"
+	if err := call.SendRefer(ctx, target); err != nil {
+		t.Fatalf("SendRefer: %v", err)
+	}
+
+	select {
+	case val := <-gotReferTo:
+		if !strings.Contains(val, target) {
+			t.Errorf("Refer-To = %q, want to contain %q", val, target)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("UAS did not receive REFER")
+	}
+}
+
+func TestSendRefer_Rejected(t *testing.T) {
+	pbx := NewFakePBX(t)
+	uas := testUAS(t)
+	uas.autoAnswer(SDP("127.0.0.1", 40000, PCMU))
+	uas.srv.OnRefer(func(req *sip.Request, tx sip.ServerTransaction) {
+		res := sip.NewResponseFromRequest(req, 603, "Declined", nil)
+		tx.Respond(res)
+	})
+	uas.start(t)
+
+	ctx := context.Background()
+
+	call, err := pbx.SendInvite(ctx, uas.uasURI("alice"), SDP("127.0.0.1", 20000, PCMU))
+	if err != nil {
+		t.Fatalf("SendInvite: %v", err)
+	}
+
+	err = call.SendRefer(ctx, "sip:bob@192.168.1.100")
+	if err == nil {
+		t.Fatal("SendRefer should fail on rejection")
+	}
+	if !strings.Contains(err.Error(), "603") {
+		t.Errorf("error = %q, want to contain '603'", err)
+	}
+}
+
+func TestSendRefer_Inbound(t *testing.T) {
+	pbx := NewFakePBX(t)
+
+	referDone := make(chan error, 1)
+	pbx.OnInvite(func(inv *Invite) {
+		inv.Trying()
+		inv.Ringing()
+		ac := inv.Answer(SDP("127.0.0.1", 20000, PCMU))
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		referDone <- ac.SendRefer(ctx, "sip:charlie@10.0.0.1")
+	})
+
+	// Use testUAS as the caller — it has both client and server,
+	// so in-dialog REFER from PBX can be received.
+	caller := testUAS(t)
+	caller.srv.OnRefer(func(req *sip.Request, tx sip.ServerTransaction) {
+		res := sip.NewResponseFromRequest(req, 202, "Accepted", nil)
+		tx.Respond(res)
+	})
+	caller.start(t)
+
+	result := sendInviteWithContact(t, caller.cli, pbx.URI("alice"), SDP("127.0.0.1", 30000, PCMU), caller.addr)
+	defer result.TX.Terminate()
+	if result.Final.StatusCode != 200 {
+		t.Fatalf("INVITE final = %d, want 200", result.Final.StatusCode)
+	}
+
+	if err := <-referDone; err != nil {
+		t.Fatalf("SendRefer from ActiveCall: %v", err)
+	}
+}
+
+// =============================================================================
+// Phase 4: Out-of-Dialog MESSAGE and OPTIONS (UAC) Tests
+// =============================================================================
+
+func TestSendMessage_Basic(t *testing.T) {
+	pbx := NewFakePBX(t)
+	uas := testUAS(t)
+
+	type msgResult struct {
+		body        string
+		contentType string
+	}
+	got := make(chan msgResult, 1)
+	uas.srv.OnMessage(func(req *sip.Request, tx sip.ServerTransaction) {
+		r := msgResult{body: string(req.Body())}
+		if h := req.GetHeader("Content-Type"); h != nil {
+			r.contentType = h.Value()
+		}
+		res := sip.NewResponseFromRequest(req, 200, "OK", nil)
+		tx.Respond(res)
+		got <- r
+	})
+	uas.start(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := pbx.SendMessage(ctx, uas.uasURI("alice"), "text/plain", []byte("Hello, Alice!"))
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+
+	select {
+	case r := <-got:
+		if r.body != "Hello, Alice!" {
+			t.Errorf("body = %q, want %q", r.body, "Hello, Alice!")
+		}
+		if r.contentType != "text/plain" {
+			t.Errorf("Content-Type = %q, want text/plain", r.contentType)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("UAS did not receive MESSAGE")
+	}
+}
+
+func TestSendMessage_Rejected(t *testing.T) {
+	pbx := NewFakePBX(t)
+	uas := testUAS(t)
+	uas.srv.OnMessage(func(req *sip.Request, tx sip.ServerTransaction) {
+		res := sip.NewResponseFromRequest(req, 403, "Forbidden", nil)
+		tx.Respond(res)
+	})
+	uas.start(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := pbx.SendMessage(ctx, uas.uasURI("alice"), "text/plain", []byte("blocked"))
+	if err == nil {
+		t.Fatal("SendMessage should fail on rejection")
+	}
+	if !strings.Contains(err.Error(), "403") {
+		t.Errorf("error = %q, want to contain '403'", err)
+	}
+}
+
+func TestSendMessage_InvalidURI(t *testing.T) {
+	pbx := NewFakePBX(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := pbx.SendMessage(ctx, "not-a-uri", "text/plain", []byte("test"))
+	if err == nil {
+		t.Fatal("SendMessage should fail on invalid URI")
+	}
+}
+
+func TestSendOptions_Basic(t *testing.T) {
+	pbx := NewFakePBX(t)
+	uas := testUAS(t)
+	uas.srv.OnOptions(func(req *sip.Request, tx sip.ServerTransaction) {
+		res := sip.NewResponseFromRequest(req, 200, "OK", nil)
+		res.AppendHeader(sip.NewHeader("Allow", "INVITE, ACK, BYE, CANCEL, OPTIONS"))
+		tx.Respond(res)
+	})
+	uas.start(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	res, err := pbx.SendOptions(ctx, uas.uasURI("alice"))
+	if err != nil {
+		t.Fatalf("SendOptions: %v", err)
+	}
+	if res.StatusCode != 200 {
+		t.Errorf("StatusCode = %d, want 200", res.StatusCode)
+	}
+	if allow := res.GetHeader("Allow"); allow == nil {
+		t.Error("response missing Allow header")
+	} else if !strings.Contains(allow.Value(), "INVITE") {
+		t.Errorf("Allow = %q, want to contain INVITE", allow.Value())
+	}
+}
+
+func TestSendOptions_Rejected(t *testing.T) {
+	pbx := NewFakePBX(t)
+	uas := testUAS(t)
+	uas.srv.OnOptions(func(req *sip.Request, tx sip.ServerTransaction) {
+		res := sip.NewResponseFromRequest(req, 405, "Method Not Allowed", nil)
+		tx.Respond(res)
+	})
+	uas.start(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	res, err := pbx.SendOptions(ctx, uas.uasURI("alice"))
+	if err != nil {
+		t.Fatalf("SendOptions should not error on non-2xx: %v", err)
+	}
+	if res.StatusCode != 405 {
+		t.Errorf("StatusCode = %d, want 405", res.StatusCode)
+	}
+}
+
+func TestSendOptions_InvalidURI(t *testing.T) {
+	pbx := NewFakePBX(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err := pbx.SendOptions(ctx, "not-a-uri")
+	if err == nil {
+		t.Fatal("SendOptions should fail on invalid URI")
 	}
 }
 

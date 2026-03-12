@@ -349,6 +349,51 @@ func (pbx *FakePBX) SendInvite(ctx context.Context, target string, sdp []byte) (
 	}
 }
 
+// SendMessage sends an out-of-dialog SIP MESSAGE to the given target URI.
+func (pbx *FakePBX) SendMessage(ctx context.Context, target string, contentType string, body []byte) error {
+	var uri sip.Uri
+	if err := sip.ParseUri(target, &uri); err != nil {
+		return fmt.Errorf("fakepbx: invalid target URI %q: %w", target, err)
+	}
+
+	req := sip.NewRequest(sip.MESSAGE, uri)
+	req.SetTransport(pbx.cfg.transport)
+	req.AppendHeader(&sip.ContactHeader{Address: pbx.contactURI()})
+	if contentType != "" {
+		req.AppendHeader(sip.NewHeader("Content-Type", contentType))
+	}
+	if body != nil {
+		req.SetBody(body)
+	}
+
+	res, err := pbx.cli.Do(ctx, req)
+	if err != nil {
+		return fmt.Errorf("fakepbx: MESSAGE: %w", err)
+	}
+	if !res.IsSuccess() {
+		return fmt.Errorf("fakepbx: MESSAGE rejected: %d %s", res.StatusCode, res.Reason)
+	}
+	return nil
+}
+
+// SendOptions sends an out-of-dialog SIP OPTIONS to the given target URI.
+// Returns the response so callers can inspect capabilities (Allow, Supported, etc.).
+func (pbx *FakePBX) SendOptions(ctx context.Context, target string) (*sip.Response, error) {
+	var uri sip.Uri
+	if err := sip.ParseUri(target, &uri); err != nil {
+		return nil, fmt.Errorf("fakepbx: invalid target URI %q: %w", target, err)
+	}
+
+	req := sip.NewRequest(sip.OPTIONS, uri)
+	req.SetTransport(pbx.cfg.transport)
+
+	res, err := pbx.cli.Do(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("fakepbx: OPTIONS: %w", err)
+	}
+	return res, nil
+}
+
 // sendACK sends an ACK for a 2xx INVITE response (RFC 3261 §13.2.2.4).
 func (pbx *FakePBX) sendACK(invReq *sip.Request, invRes *sip.Response) {
 	ack := sip.NewRequest(sip.ACK, invReq.Recipient)

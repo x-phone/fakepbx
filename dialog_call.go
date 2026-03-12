@@ -56,6 +56,22 @@ func (c *dialogCall) SendReInvite(ctx context.Context, sdp []byte) error {
 	return nil
 }
 
+// SendRefer sends a REFER within the dialog (e.g., blind/attended transfer).
+// The referTo parameter is the SIP URI of the transfer target.
+func (c *dialogCall) SendRefer(ctx context.Context, referTo string) error {
+	refer := c.newDialogRequest(sip.REFER)
+	refer.AppendHeader(sip.NewHeader("Refer-To", referTo))
+
+	res, err := c.pbx.cli.Do(ctx, refer)
+	if err != nil {
+		return err
+	}
+	if !res.IsSuccess() {
+		return fmt.Errorf("REFER failed: %d %s", res.StatusCode, res.Reason)
+	}
+	return nil
+}
+
 // SendNotify sends a NOTIFY within the dialog (e.g., transfer status after REFER).
 func (c *dialogCall) SendNotify(ctx context.Context, eventType, body string) error {
 	notify := c.newDialogRequest(sip.NOTIFY)
